@@ -1,9 +1,10 @@
 # -*- encoding: utf-8 -*-
 import falcon
+import pytest
 from falcon import testing
 
 from keri import Vrsn_2_0
-from keri.acdc import Regery, acdcmap, blindate, regcept
+from keri.acdc import Regery, acdcmap, blindate, regcept, regeventing
 from keri.acdc.regbasing import RegBaser
 from keri.app.habbing import openHab, openHby
 from keri.app.configing import Configer
@@ -11,6 +12,7 @@ from keri.app.httping import CESR_CONTENT_TYPE
 from keri.core import Blinder, Kevery, SerderACDC, query
 from keri.core.signing import Salter
 from keri.help import helping
+from keri.kering import MissingAnchorError
 
 from kfregistrar.core.serving import Context, makeContext
 from kfregistrar.core.ingesting import ControllerIngester, ingestKel
@@ -73,6 +75,25 @@ def _kelClone(hab):
     for msg in hab.db.clonePreIter(pre=hab.pre, gvrsn=Vrsn_2_0):
         stream.extend(msg)
     return stream.decode("utf-8")
+
+
+def _recoveryChain(wallet):
+    rip = regcept(israid=wallet.pre, stamp=STAMP0)
+    acdc = acdcmap(
+        israid=wallet.pre,
+        regid=rip.said,
+        attribute=dict(d="", name="recovery-history"),
+    )
+
+    def update(prior, sn, state):
+        blinder = Blinder.blind(acdc=acdc.said, state=state, salt=SALT, sn=sn)
+        return blindate(
+            regid=rip.said, prior=prior, blid=blinder.said, sn=sn, stamp=STAMP1
+        )
+
+    first = update(rip.said, 1, "issued")
+    second = update(first.said, 2, "revoked")
+    return rip, first, second
 
 
 def test_internal_rip_bup_land_in_regbaser():
@@ -552,6 +573,285 @@ def test_controller_pending_tel_survives_restart_and_recovers_when_kel_arrives(
             assert not list(rgy.store.baser.maes.getTopItemIter(keys=regk))
         finally:
             rgy.close()
+
+
+def test_controller_separate_pending_submissions_survive_restart(tmp_path):
+    """An anchored submission can recover independently of its pending extension."""
+    with openHab(name="kf-separate-wallet", temp=True, version=Vrsn_2_0) as (
+        _whby, wallet
+    ):
+        rip, first, second = _recoveryChain(wallet)
+        _anchor(wallet, rip, first)
+        prefix_kel = _kelClone(wallet)
+        _anchor(wallet, second)
+        full_kel = _kelClone(wallet)
+    regk = rip.said
+
+    def openRestartHby():
+        return openHby(
+            name="kf-separate-host", base="test", temp=False,
+            headDirPath=str(tmp_path), salt=SALT, version=Vrsn_2_0,
+            cf=Configer(name="kf-separate-host", base="test", temp=True,
+                        headDirPath=str(tmp_path)),
+        )
+
+    with openRestartHby() as hby:
+        hby.makeHab(name="registrar")
+        baser = RegBaser(name=hby.name, base=hby.base, temp=False,
+                         headDirPath=str(tmp_path))
+        rgy = Regery(hby=hby, name=hby.name, base=hby.base, baser=baser)
+        ingester = ControllerIngester(
+            hby=hby, store=rgy.store, kvy=Kevery(db=hby.db, lax=True, local=False)
+        )
+        try:
+            for tel in (_telStream(rip, first), _telStream(rip, first, second)):
+                assert regk in ingester.ingest(b"", tel)["pending"]
+            assert regk in ingester.ingest(b"", _telStream(rip, first))["pending"]
+            assert ingester.submissions.cnt() == 2
+            assert rgy.store.head(regk) is None
+            assert len(list(baser.maes.getTopItemIter(keys=regk))) == 3
+        finally:
+            rgy.close()
+
+    with openRestartHby() as hby:
+        baser = RegBaser(name=hby.name, base=hby.base, temp=False,
+                         headDirPath=str(tmp_path))
+        rgy = Regery(hby=hby, name=hby.name, base=hby.base, baser=baser)
+        ingester = ControllerIngester(
+            hby=hby, store=rgy.store, kvy=Kevery(db=hby.db, lax=True, local=False)
+        )
+        try:
+            ingestKel(ingester.kvy, prefix_kel)
+            regeventing.vet(rip=rip, updates=[first], db=hby.db)
+            with pytest.raises(MissingAnchorError):
+                regeventing.vet(rip=rip, updates=[first, second], db=hby.db)
+            ingester.retryPending()
+            assert rgy.store.seqEvent(regk, 1) is not None, (
+                "independent anchored submission was not recovered"
+            )
+            assert rgy.store.headEvent(regk).said == first.said
+            assert rgy.store.seqEvent(regk, 2) is None
+            assert list(baser.maes.getTopItemIter(keys=regk))
+            assert ingester.submissions.cnt() == 1
+            assert {said for _keys, _sn, (said,) in baser.maes.getTopItemIter(keys=regk)} == {
+                rip.said, first.said, second.said
+            }
+            rejected = ingester.ingest(b"", _telStream(rip, second))
+            assert regk in rejected["rejected"]
+            assert ingester.submissions.cnt() == 1
+
+            ingestKel(ingester.kvy, full_kel)
+            ingester.retryPending()
+            assert rgy.store.cloneTel(regk) == _telStream(rip, first, second)
+            assert not list(baser.maes.getTopItemIter(keys=regk))
+            assert ingester.submissions.cnt() == 0
+        finally:
+            rgy.close()
+
+
+def test_controller_accepting_prefix_preserves_pending_remainder(tmp_path):
+    """Accepting a separately submitted prefix keeps its extension retryable."""
+    with openHab(name="kf-remainder-wallet", temp=True, version=Vrsn_2_0) as (
+        _whby, wallet
+    ):
+        rip, first, second = _recoveryChain(wallet)
+        _anchor(wallet, rip, first)
+        prefix_kel = _kelClone(wallet)
+        _anchor(wallet, second)
+        full_kel = _kelClone(wallet)
+    regk = rip.said
+
+    def openRestartHby():
+        return openHby(
+            name="kf-remainder-host", base="test", temp=False,
+            headDirPath=str(tmp_path), salt=SALT, version=Vrsn_2_0,
+            cf=Configer(name="kf-remainder-host", base="test", temp=True,
+                        headDirPath=str(tmp_path)),
+        )
+
+    with openRestartHby() as hby:
+        hby.makeHab(name="registrar")
+        baser = RegBaser(name=hby.name, base=hby.base, temp=False,
+                         headDirPath=str(tmp_path))
+        rgy = Regery(hby=hby, name=hby.name, base=hby.base, baser=baser)
+        ingester = ControllerIngester(
+            hby=hby, store=rgy.store, kvy=Kevery(db=hby.db, lax=True, local=False)
+        )
+        try:
+            pending = ingester.ingest(prefix_kel, _telStream(rip, first, second))
+            assert regk in pending["pending"]
+            ingester.retryPending()
+            assert rgy.store.head(regk) is None
+            accepted = ingester.ingest(b"", _telStream(rip, first))
+            assert regk in accepted["accepted"]
+            assert rgy.store.headEvent(regk).said == first.said
+            assert rgy.store.seqEvent(regk, 2) is None
+            assert any(rgy.store.event(said).said == second.said
+                       for _keys, _sn, said in baser.maes.getTopItemIter(keys=regk))
+        finally:
+            rgy.close()
+
+    with openRestartHby() as hby:
+        baser = RegBaser(name=hby.name, base=hby.base, temp=False,
+                         headDirPath=str(tmp_path))
+        rgy = Regery(hby=hby, name=hby.name, base=hby.base, baser=baser)
+        ingester = ControllerIngester(
+            hby=hby, store=rgy.store, kvy=Kevery(db=hby.db, lax=True, local=False)
+        )
+        try:
+            assert rgy.store.headEvent(regk).said == first.said
+            ingestKel(ingester.kvy, full_kel)
+            ingester.retryPending()
+            assert rgy.store.seqEvent(regk, 2) is not None, (
+                "pending continuation was stranded after accepting its prefix"
+            )
+            assert rgy.store.cloneTel(regk) == _telStream(rip, first, second)
+            assert not list(baser.maes.getTopItemIter(keys=regk))
+        finally:
+            rgy.close()
+
+
+def test_controller_submission_metadata_survives_interrupted_bookkeeping():
+    """Membership remains authoritative through missing rows, bodies, and cleanup."""
+    with openHab(name="kf-metadata-wallet", temp=True, version=Vrsn_2_0) as (
+        _whby, wallet
+    ):
+        rip, first, second = _recoveryChain(wallet)
+        _anchor(wallet, rip, first, second)
+        kel = _kelClone(wallet)
+    regk = rip.said
+    tel = _telStream(rip, first, second)
+    with openHby(name="kf-metadata-host", base="test", temp=True, version=Vrsn_2_0) as hby:
+        hby.makeHab(name="registrar")
+        ctx = makeContext(hby=hby, alias="registrar", observers=[])
+        store = ctx.rgy.store
+        try:
+            assert regk in ctx.ingester.ingest(b"", tel)["pending"]
+            key, record = next(ctx.ingester.submissions.getTopItemIter())
+            # Membership committed, but per-event escrow writes were interrupted.
+            for sn, serder in enumerate((rip, first, second)):
+                store.clearEscrows(regk, sn, serder.said)
+            ingester = ControllerIngester(hby=hby, store=store, kvy=ctx.kvy)
+            assert regk in ingester.retryPending()["pending"]
+            assert len(list(store.baser.maes.getTopItemIter(keys=regk))) == 3
+
+            assert store.baser.evts.rem(keys=first.said)
+            ingester = ControllerIngester(hby=hby, store=store, kvy=ctx.kvy)
+            rejected = ingester.retryPending()
+            assert first.said in rejected["rejected"][regk]
+            assert store.head(regk) is None
+            assert ingester.submissions.cnt() == 1
+            assert regk in ingester.ingest(b"", tel)["pending"]
+            assert ingester.submissions.cnt() == 1
+            ingestKel(ctx.kvy, kel)
+            assert regk in ingester.retryPending()["accepted"]
+            assert store.cloneTel(regk) == tel
+            assert ingester.submissions.cnt() == 0
+            assert not list(store.baser.maes.getTopItemIter(keys=regk))
+
+            # Accepted slots and escrow cleanup committed; membership removal did not.
+            slots = [store.seqSaider(regk, sn).qb64 for sn in range(3)]
+            ingester.submissions.pin(keys=key, val=record)
+            ingester = ControllerIngester(hby=hby, store=store, kvy=ctx.kvy)
+            assert regk in ingester.retryPending()["accepted"]
+            assert [store.seqSaider(regk, sn).qb64 for sn in range(3)] == slots
+            assert ingester.submissions.cnt() == 0
+        finally:
+            ctx.rgy.close()
+
+
+def test_controller_legacy_escrow_requires_reingestion_and_is_preserved():
+    """Legacy references are held, never guessed into a submission or auto-deleted."""
+    with openHab(name="kf-legacy-wallet", temp=True, version=Vrsn_2_0) as (
+        _whby, wallet
+    ):
+        rip, first, second = _recoveryChain(wallet)
+        _anchor(wallet, rip, first)
+        prefix_kel = _kelClone(wallet)
+        _anchor(wallet, second)
+        full_kel = _kelClone(wallet)
+    regk = rip.said
+    with openHby(name="kf-legacy-host", base="test", temp=True, version=Vrsn_2_0) as hby:
+        hby.makeHab(name="registrar")
+        ctx = makeContext(hby=hby, alias="registrar", observers=[])
+        store = ctx.rgy.store
+        try:
+            for sn, serder in enumerate((rip, first, second)):
+                store.putEvent(serder)
+                store.escrowMissingAnchor(regk, sn, serder.said)
+            store.escrowOutOfOrder(regk, 1, first.said)
+            legacy = list(store.baser.maes.getTopItemIter(keys=regk))
+            legacy_order = list(store.baser.ooes.getTopItemIter(keys=regk))
+            ingester = ControllerIngester(hby=hby, store=store, kvy=ctx.kvy)
+            ingestKel(ctx.kvy, prefix_kel)
+            assert not ingester.retryPending()["accepted"]
+            assert store.head(regk) is None
+            assert not ingester.pending
+
+            assert regk in ingester.ingest(b"", _telStream(rip, first))["accepted"]
+            assert store.headEvent(regk).said == first.said
+            assert regk in ingester.ingest(b"", _telStream(rip, first, second))["pending"]
+            ingester = ControllerIngester(hby=hby, store=store, kvy=ctx.kvy)
+            assert regk in ingester.retryPending()["pending"]
+            assert store.seqEvent(regk, 2) is None
+            ingestKel(ctx.kvy, full_kel)
+            assert regk in ingester.retryPending()["accepted"]
+            assert store.cloneTel(regk) == _telStream(rip, first, second)
+            assert not ingester.pending
+            assert list(store.baser.maes.getTopItemIter(keys=regk)) == legacy
+            assert list(store.baser.ooes.getTopItemIter(keys=regk)) == legacy_order
+            assert set(ingester.submissions.get(keys=(regk, "legacy")).saids) == {
+                rip.said, first.said, second.said
+            }
+        finally:
+            ctx.rgy.close()
+
+
+@pytest.mark.parametrize("missing_head", [True, False], ids=["missing", "stale"])
+def test_controller_replay_repairs_interrupted_head(missing_head):
+    """Exact verified replay repairs the head without replacing accepted slots."""
+    with openHab(name="kf-head-wallet", temp=True, version=Vrsn_2_0) as (
+        _whby, wallet
+    ):
+        rip, first, second = _recoveryChain(wallet)
+        fork_blinder = Blinder.blind(
+            acdc="", state="reinstated", salt=SALT, sn=2
+        )
+        fork = blindate(regid=rip.said, prior=first.said,
+                        blid=fork_blinder.said, sn=2, stamp=STAMP1)
+        _anchor(wallet, rip, first, second, fork)
+        kel = _kelClone(wallet)
+    regk = rip.said
+    tel = _telStream(rip, first, second)
+
+    with openHby(name="kf-head-host", base="test", temp=True, version=Vrsn_2_0) as hby:
+        hby.makeHab(name="registrar")
+        ctx = makeContext(hby=hby, alias="registrar", observers=[])
+        store = ctx.rgy.store
+        try:
+            assert regk in ctx.ingester.ingest(kel, tel)["accepted"]
+            slots = [store.seqSaider(regk, sn).qb64 for sn in range(3)]
+            if missing_head:
+                assert store.baser.heads.rem(keys=regk)
+            else:
+                store.baser.heads.pin(keys=regk, val=store.seqSaider(regk, 0))
+
+            assert regk in ctx.ingester.ingest(b"", tel)["accepted"]
+            assert store.headEvent(regk) is not None, "replay did not repair missing head"
+            assert store.headEvent(regk).said == second.said
+            assert [store.seqSaider(regk, sn).qb64 for sn in range(3)] == slots
+            assert store.cloneTel(regk) == tel
+
+            for replay in (tel, _telStream(rip, first)):
+                assert regk in ctx.ingester.ingest(b"", replay)["accepted"]
+                assert store.headEvent(regk).said == second.said
+                assert store.cloneTel(regk) == tel
+            conflict = ctx.ingester.ingest(b"", _telStream(rip, first, fork))
+            assert regk in conflict["rejected"]
+            assert [store.seqSaider(regk, sn).qb64 for sn in range(3)] == slots
+            assert store.headEvent(regk).said == second.said
+        finally:
+            ctx.rgy.close()
 
 
 def test_external_api_has_no_ingest_route():
